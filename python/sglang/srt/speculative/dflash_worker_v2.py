@@ -62,15 +62,11 @@ def _get_fused_kv_materialize_helper():
 class _DflashDraftSampleHook:
     """Capture-safe greedy argmax over the target LM head.
 
-    DFLASH's draft model has no LM head of its own; it borrows the target
-    model's `lm_head` to turn draft hidden states into proposed draft tokens.
-    That projection normally runs eagerly in the worker between the draft and
-    verify forwards. This hook lets the decode cuda graph runner fold it INTO
-    the draft graph so it replays with the forward (no eager launch in the gap)
-    and is accounted in fwd_occupancy.
-
-    Only the tp=1 / no-added-vocab fast path is capturable (matmul + argmax with
-    static shapes). The TP>1 all-gather path stays eager in the worker.
+    DFLASH's draft has no LM head of its own; it borrows the target `lm_head`
+    to turn draft hidden into proposed tokens. Folding this projection into the
+    draft cuda graph (vs. running it eagerly between forwards) lets it replay
+    with the forward and be counted in fwd_occupancy. Capturable only on the
+    tp=1 / no-added-vocab fast path; TP>1 stays eager in the worker.
     """
 
     def __init__(self, *, weight, block_size, num_org, org_vocab_start):
@@ -80,8 +76,8 @@ class _DflashDraftSampleHook:
         self.org_vocab_start = int(org_vocab_start)
 
     def run(self, hidden_states, out_tokens):
-        # hidden_states: [bs * block_size, H] (draft model output). Draft tokens
-        # come from block positions 1: (position 0 is the seeded bonus token).
+        # [bs * block_size, H]; draft tokens are block positions 1: (pos 0 is the
+        # seeded bonus token).
         bs = hidden_states.shape[0] // self.block_size
         hs = hidden_states.view(bs, self.block_size, -1)[:, 1:, :].reshape(
             -1, hidden_states.shape[-1]
@@ -194,8 +190,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         set_global_server_args_for_scheduler(saved_server_args)
         self.draft_model_runner = self._draft_worker.model_runner
-        # Set in init_cuda_graphs when the draft greedy head is folded into the
-        # draft decode cuda graph (tp=1 fast path); None keeps the eager head.
+        # Draft greedy-head graph hook (set in init_cuda_graphs); None = eager.
         self._draft_sample_hook = None
         # Keep the same alias that other spec-v2 workers expose.
         self._draft_worker.draft_runner = self.draft_model_runner
@@ -345,8 +340,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     available_mem,
                 )
         if capture_decode_cuda_graph:
-            # Attach the draft greedy-head hook before capture so the draft
-            # decode graph folds the head in (tp=1 fast path only).
+            # Attach before capture so the draft graph can fold the head in.
             self._draft_sample_hook = self._maybe_build_draft_sample_hook()
             self.draft_model_runner.dflash_draft_sample = self._draft_sample_hook
         self._draft_worker.init_cuda_graphs(
@@ -354,9 +348,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
     def _maybe_build_draft_sample_hook(self):
-        # Fold the draft greedy head into the draft decode cuda graph only for
-        # the capture-safe tp=1 / no-added-vocab fast path; otherwise the worker
-        # keeps doing the (TP-aware, host-branching) head eagerly.
+        # Capturable only on the tp=1 / no-added-vocab fast path; otherwise keep
+        # the eager (TP-aware) head in the worker.
         if get_tp_group().world_size != 1:
             return None
         target_model = self._target_worker.model_runner.model
@@ -1554,8 +1547,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_logits_output = draft_out.logits_output
 
         if self._draft_sample_hook is not None and draft_out.can_run_graph:
-            # The draft greedy head ran inside the draft decode cuda graph; read
-            # the proposed tokens from its output buffer instead of re-running it.
+            # Head ran inside the draft cuda graph; read its output buffer.
             graph_runner = self.draft_model_runner.decode_cuda_graph_runner
             draft_next = graph_runner.dflash_draft_tokens_buf[
                 : bs * (int(self.block_size) - 1)

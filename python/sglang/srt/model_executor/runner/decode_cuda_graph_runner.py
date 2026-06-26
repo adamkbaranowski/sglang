@@ -262,19 +262,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
         self.attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
 
-        # DFLASH may fold its draft greedy head into this graph (tp=1 fast path).
-        # The hook is attached to the draft model_runner before capture; allocate
-        # the output buffer for the proposed draft tokens (block positions 1:).
-        self.dflash_draft_sample = getattr(
-            self.model_runner, "dflash_draft_sample", None
-        )
-        self.dflash_draft_tokens_buf = None
-        if self.dflash_draft_sample is not None and self.num_tokens_per_bs > 1:
-            self.dflash_draft_tokens_buf = torch.zeros(
-                (self.max_bs * (self.num_tokens_per_bs - 1),),
-                dtype=torch.int64,
-                device=self.model_runner.device,
-            )
+        self._init_dflash_draft_sample()
 
         # Init PDMux if needed
         self.maybe_init_pdmux()
@@ -368,6 +356,21 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         except RuntimeError as e:
             raise Exception(
                 f"Capture cuda graph failed: {e}\n" f"{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
+            )
+
+    def _init_dflash_draft_sample(self):
+        # DFLASH may fold its draft greedy head into this graph; allocate the
+        # output buffer for the proposed draft tokens (block positions 1:). The
+        # hook is attached to the draft model_runner before capture.
+        self.dflash_draft_sample = getattr(
+            self.model_runner, "dflash_draft_sample", None
+        )
+        self.dflash_draft_tokens_buf = None
+        if self.dflash_draft_sample is not None and self.num_tokens_per_bs > 1:
+            self.dflash_draft_tokens_buf = torch.zeros(
+                (self.max_bs * (self.num_tokens_per_bs - 1),),
+                dtype=torch.int64,
+                device=self.model_runner.device,
             )
 
     def _autotune_buffers(self):
@@ -827,9 +830,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     and isinstance(out, LogitsProcessorOutput)
                     and out.hidden_states is not None
                 ):
-                    # Fold the draft greedy head into the captured region so it
-                    # replays with the forward (no eager launch in the gap) and
-                    # is accounted in fwd_occupancy.
+                    # Fold the draft greedy head into the captured region (see
+                    # _DflashDraftSampleHook); replays with the forward.
                     self.dflash_draft_sample.run(
                         out.hidden_states,
                         self.dflash_draft_tokens_buf[: num_tokens - bs],

@@ -367,7 +367,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         self.dflash_draft_tokens_buf = None
         if self.dflash_draft_sample is not None and self.num_tokens_per_bs > 1:
-            self.dflash_draft_tokens_buf = torch.zeros(
+            self.dflash_draft_tokens_buf = torch.empty(
                 (self.max_bs * (self.num_tokens_per_bs - 1),),
                 dtype=torch.int64,
                 device=self.model_runner.device,
@@ -826,7 +826,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     **kwargs,
                 )
                 if (
-                    self.dflash_draft_sample is not None
+                    self.dflash_draft_tokens_buf is not None
                     and isinstance(out, LogitsProcessorOutput)
                     and out.hidden_states is not None
                 ):

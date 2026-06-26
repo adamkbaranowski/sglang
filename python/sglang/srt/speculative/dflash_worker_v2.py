@@ -87,7 +87,7 @@ class _DflashDraftSampleHook:
         logits = torch.matmul(hs, self.weight[: self.num_org].T)
         tokens = torch.argmax(logits, dim=-1).to(torch.long)
         if self.org_vocab_start:
-            tokens = tokens + self.org_vocab_start
+            tokens += self.org_vocab_start
         out_tokens.copy_(tokens)
 
 
@@ -354,7 +354,13 @@ class DFlashWorkerV2(BaseSpecWorker):
             return None
         target_model = self._target_worker.model_runner.model
         lm_head = getattr(target_model, "lm_head", None)
-        if lm_head is None or not hasattr(lm_head, "weight"):
+        if (
+            lm_head is None
+            or not hasattr(lm_head, "weight")
+            or not torch.is_floating_point(lm_head.weight)
+        ):
+            # Quantized lm_head (FP8/INT) can't go through the static float
+            # matmul hook; keep the eager head for it.
             return None
         if not hasattr(lm_head, "shard_indices"):
             num_org = int(lm_head.weight.shape[0])
@@ -1546,9 +1552,13 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_out = self.draft_model_runner.forward(forward_batch)
         draft_logits_output = draft_out.logits_output
 
-        if self._draft_sample_hook is not None and draft_out.can_run_graph:
+        graph_runner = self.draft_model_runner.decode_cuda_graph_runner
+        if (
+            self._draft_sample_hook is not None
+            and draft_out.can_run_graph
+            and getattr(graph_runner, "dflash_draft_tokens_buf", None) is not None
+        ):
             # Head ran inside the draft cuda graph; read its output buffer.
-            graph_runner = self.draft_model_runner.decode_cuda_graph_runner
             draft_next = graph_runner.dflash_draft_tokens_buf[
                 : bs * (int(self.block_size) - 1)
             ].view(bs, int(self.block_size) - 1)

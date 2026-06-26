@@ -808,13 +808,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     forward_batch,
                     **kwargs,
                 )
-                dflash_sample = getattr(self.model_runner, "dflash_draft_sample", None)
+                dflash_sampler = getattr(
+                    self.model_runner, "dflash_draft_sampler", None
+                )
                 if (
-                    dflash_sample is not None
+                    dflash_sampler is not None
                     and isinstance(out, LogitsProcessorOutput)
                     and out.hidden_states is not None
                 ):
-                    dflash_sample.run(out.hidden_states)
+                    dflash_sampler(out.hidden_states)
                 return out
 
             self.deepep_adapter.capture(is_extend_in_batch=False)

@@ -59,7 +59,7 @@ def _get_fused_kv_materialize_helper():
     return _FusedKVMaterializeHelper
 
 
-class _DflashDraftSampleHook:
+class _DflashDraftSampler:
     """Capture-safe greedy argmax over the target LM head, run inside the draft
     cuda graph so the draft sampling is captured and counted in fwd_occupancy.
     DFLASH's draft has no head of its own; it borrows the target `lm_head`.
@@ -78,7 +78,7 @@ class _DflashDraftSampleHook:
             device=weight.device,
         )
 
-    def run(self, hidden_states):
+    def __call__(self, hidden_states):
         # draft tokens are block positions 1: (pos 0 is the seeded bonus token)
         bs = hidden_states.shape[0] // self.block_size
         hs = hidden_states.view(bs, self.block_size, -1)[:, 1:, :].reshape(
@@ -192,7 +192,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         set_global_server_args_for_scheduler(saved_server_args)
         self.draft_model_runner = self._draft_worker.model_runner
-        self._draft_sample_hook = None
+        self._draft_sampler = None
         # Keep the same alias that other spec-v2 workers expose.
         self._draft_worker.draft_runner = self.draft_model_runner
         self.draft_model = self.draft_model_runner.model
@@ -342,13 +342,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                 )
         if capture_decode_cuda_graph:
             # Must run before capture so the draft graph folds the head in.
-            self._draft_sample_hook = self._maybe_build_draft_sample_hook()
-            self.draft_model_runner.dflash_draft_sample = self._draft_sample_hook
+            self._draft_sampler = self._maybe_build_draft_sampler()
+            self.draft_model_runner.dflash_draft_sampler = self._draft_sampler
         self._draft_worker.init_cuda_graphs(
             capture_decode_cuda_graph=capture_decode_cuda_graph
         )
 
-    def _maybe_build_draft_sample_hook(self):
+    def _maybe_build_draft_sampler(self):
         if get_tp_group().world_size != 1 or self.block_size <= 1:
             return None
         target_model = self._target_worker.model_runner.model
@@ -369,7 +369,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 return None
             num_org = int(shard.num_org_elements)
             org_vocab_start = int(shard.org_vocab_start_index)
-        return _DflashDraftSampleHook(
+        return _DflashDraftSampler(
             weight=lm_head.weight,
             block_size=self.block_size,
             num_org=num_org,
@@ -1551,8 +1551,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_out = self.draft_model_runner.forward(forward_batch)
         draft_logits_output = draft_out.logits_output
 
-        if self._draft_sample_hook is not None and draft_out.can_run_graph:
-            draft_next = self._draft_sample_hook.out[
+        if self._draft_sampler is not None and draft_out.can_run_graph:
+            draft_next = self._draft_sampler.out[
                 : bs * (int(self.block_size) - 1)
             ].view(bs, int(self.block_size) - 1)
         else:

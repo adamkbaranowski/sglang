@@ -66,13 +66,19 @@ class _DflashDraftSampleHook:
     tp=1 / no-added-vocab only; TP>1 stays eager in the worker.
     """
 
-    def __init__(self, *, weight, block_size, num_org, org_vocab_start):
+    def __init__(self, *, weight, block_size, num_org, org_vocab_start, max_bs):
         self.weight = weight
         self.block_size = int(block_size)
         self.num_org = int(num_org)
         self.org_vocab_start = int(org_vocab_start)
+        # Proposed draft tokens: written in-graph, read by the worker after replay.
+        self.out = torch.empty(
+            (int(max_bs) * (self.block_size - 1),),
+            dtype=torch.int64,
+            device=weight.device,
+        )
 
-    def run(self, hidden_states, out_tokens):
+    def run(self, hidden_states):
         # draft tokens are block positions 1: (pos 0 is the seeded bonus token)
         bs = hidden_states.shape[0] // self.block_size
         hs = hidden_states.view(bs, self.block_size, -1)[:, 1:, :].reshape(
@@ -84,7 +90,7 @@ class _DflashDraftSampleHook:
         tokens = torch.argmax(logits, dim=-1).to(torch.long)
         if self.org_vocab_start:
             tokens += self.org_vocab_start
-        out_tokens.copy_(tokens)
+        self.out[: tokens.shape[0]].copy_(tokens)
 
 
 class DFlashWorkerV2(BaseSpecWorker):
@@ -343,7 +349,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
     def _maybe_build_draft_sample_hook(self):
-        if get_tp_group().world_size != 1:
+        if get_tp_group().world_size != 1 or self.block_size <= 1:
             return None
         target_model = self._target_worker.model_runner.model
         lm_head = getattr(target_model, "lm_head", None)
@@ -368,6 +374,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             block_size=self.block_size,
             num_org=num_org,
             org_vocab_start=org_vocab_start,
+            max_bs=self.server_args.cuda_graph_max_bs,
         )
 
     def _init_fused_kv_helper(self) -> None:
@@ -1544,13 +1551,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_out = self.draft_model_runner.forward(forward_batch)
         draft_logits_output = draft_out.logits_output
 
-        graph_runner = self.draft_model_runner.decode_cuda_graph_runner
-        if (
-            self._draft_sample_hook is not None
-            and draft_out.can_run_graph
-            and getattr(graph_runner, "dflash_draft_tokens_buf", None) is not None
-        ):
-            draft_next = graph_runner.dflash_draft_tokens_buf[
+        if self._draft_sample_hook is not None and draft_out.can_run_graph:
+            draft_next = self._draft_sample_hook.out[
                 : bs * (int(self.block_size) - 1)
             ].view(bs, int(self.block_size) - 1)
         else:

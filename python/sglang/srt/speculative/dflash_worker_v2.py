@@ -59,6 +59,42 @@ def _get_fused_kv_materialize_helper():
     return _FusedKVMaterializeHelper
 
 
+class _DflashDraftSampleHook:
+    """Capture-safe greedy argmax over the target LM head.
+
+    DFLASH's draft model has no LM head of its own; it borrows the target
+    model's `lm_head` to turn draft hidden states into proposed draft tokens.
+    That projection normally runs eagerly in the worker between the draft and
+    verify forwards. This hook lets the decode cuda graph runner fold it INTO
+    the draft graph so it replays with the forward (no eager launch in the gap)
+    and is accounted in fwd_occupancy.
+
+    Only the tp=1 / no-added-vocab fast path is capturable (matmul + argmax with
+    static shapes). The TP>1 all-gather path stays eager in the worker.
+    """
+
+    def __init__(self, *, weight, block_size, num_org, org_vocab_start):
+        self.weight = weight
+        self.block_size = int(block_size)
+        self.num_org = int(num_org)
+        self.org_vocab_start = int(org_vocab_start)
+
+    def run(self, hidden_states, out_tokens):
+        # hidden_states: [bs * block_size, H] (draft model output). Draft tokens
+        # come from block positions 1: (position 0 is the seeded bonus token).
+        bs = hidden_states.shape[0] // self.block_size
+        hs = hidden_states.view(bs, self.block_size, -1)[:, 1:, :].reshape(
+            -1, hidden_states.shape[-1]
+        )
+        if hs.dtype != self.weight.dtype:
+            hs = hs.to(self.weight.dtype)
+        logits = torch.matmul(hs, self.weight[: self.num_org].T)
+        tokens = torch.argmax(logits, dim=-1).to(torch.long)
+        if self.org_vocab_start:
+            tokens = tokens + self.org_vocab_start
+        out_tokens.copy_(tokens)
+
+
 class DFlashWorkerV2(BaseSpecWorker):
     """DFLASH speculative decoding worker (spec-v2).
 
@@ -158,6 +194,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         set_global_server_args_for_scheduler(saved_server_args)
         self.draft_model_runner = self._draft_worker.model_runner
+        # Set in init_cuda_graphs when the draft greedy head is folded into the
+        # draft decode cuda graph (tp=1 fast path); None keeps the eager head.
+        self._draft_sample_hook = None
         # Keep the same alias that other spec-v2 workers expose.
         self._draft_worker.draft_runner = self.draft_model_runner
         self.draft_model = self.draft_model_runner.model
@@ -305,8 +344,39 @@ class DFlashWorkerV2(BaseSpecWorker):
                     "memory is available after target backend initialization.",
                     available_mem,
                 )
+        if capture_decode_cuda_graph:
+            # Attach the draft greedy-head hook before capture so the draft
+            # decode graph folds the head in (tp=1 fast path only).
+            self._draft_sample_hook = self._maybe_build_draft_sample_hook()
+            self.draft_model_runner.dflash_draft_sample = self._draft_sample_hook
         self._draft_worker.init_cuda_graphs(
             capture_decode_cuda_graph=capture_decode_cuda_graph
+        )
+
+    def _maybe_build_draft_sample_hook(self):
+        # Fold the draft greedy head into the draft decode cuda graph only for
+        # the capture-safe tp=1 / no-added-vocab fast path; otherwise the worker
+        # keeps doing the (TP-aware, host-branching) head eagerly.
+        if get_tp_group().world_size != 1:
+            return None
+        target_model = self._target_worker.model_runner.model
+        lm_head = getattr(target_model, "lm_head", None)
+        if lm_head is None or not hasattr(lm_head, "weight"):
+            return None
+        if not hasattr(lm_head, "shard_indices"):
+            num_org = int(lm_head.weight.shape[0])
+            org_vocab_start = 0
+        else:
+            shard = lm_head.shard_indices
+            if int(shard.num_added_elements) != 0:
+                return None
+            num_org = int(shard.num_org_elements)
+            org_vocab_start = int(shard.org_vocab_start_index)
+        return _DflashDraftSampleHook(
+            weight=lm_head.weight,
+            block_size=self.block_size,
+            num_org=num_org,
+            org_vocab_start=org_vocab_start,
         )
 
     def _init_fused_kv_helper(self) -> None:
@@ -1480,18 +1550,27 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
         with torch.inference_mode():
-            draft_logits_output = self.draft_model_runner.forward(
-                forward_batch
-            ).logits_output
+            draft_out = self.draft_model_runner.forward(forward_batch)
+        draft_logits_output = draft_out.logits_output
 
-        draft_hidden = draft_logits_output.hidden_states
-        if draft_hidden is None:
-            raise RuntimeError("DFLASH draft model returned no hidden states.")
-        draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
-        draft_next = self._greedy_sample_from_vocab_parallel_head(
-            hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
-            lm_head=lm_head,
-        ).view(bs, int(self.block_size) - 1)
+        if self._draft_sample_hook is not None and draft_out.can_run_graph:
+            # The draft greedy head ran inside the draft decode cuda graph; read
+            # the proposed tokens from its output buffer instead of re-running it.
+            graph_runner = self.draft_model_runner.decode_cuda_graph_runner
+            draft_next = graph_runner.dflash_draft_tokens_buf[
+                : bs * (int(self.block_size) - 1)
+            ].view(bs, int(self.block_size) - 1)
+        else:
+            draft_hidden = draft_logits_output.hidden_states
+            if draft_hidden is None:
+                raise RuntimeError("DFLASH draft model returned no hidden states.")
+            draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
+            draft_next = self._greedy_sample_from_vocab_parallel_head(
+                hidden_states=draft_hidden[:, 1:, :].reshape(
+                    -1, draft_hidden.shape[-1]
+                ),
+                lm_head=lm_head,
+            ).view(bs, int(self.block_size) - 1)
 
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])

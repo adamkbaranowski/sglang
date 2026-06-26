@@ -374,7 +374,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             block_size=self.block_size,
             num_org=num_org,
             org_vocab_start=org_vocab_start,
-            max_bs=self.server_args.cuda_graph_max_bs,
+            max_bs=max(self.server_args.cuda_graph_config.decode.bs),
         )
 
     def _init_fused_kv_helper(self) -> None:

@@ -60,13 +60,10 @@ def _get_fused_kv_materialize_helper():
 
 
 class _DflashDraftSampleHook:
-    """Capture-safe greedy argmax over the target LM head.
-
-    DFLASH's draft has no LM head of its own; it borrows the target `lm_head`
-    to turn draft hidden into proposed tokens. Folding this projection into the
-    draft cuda graph (vs. running it eagerly between forwards) lets it replay
-    with the forward and be counted in fwd_occupancy. Capturable only on the
-    tp=1 / no-added-vocab fast path; TP>1 stays eager in the worker.
+    """Capture-safe greedy argmax over the target LM head, run inside the draft
+    cuda graph so the draft sampling is captured and counted in fwd_occupancy.
+    DFLASH's draft has no head of its own; it borrows the target `lm_head`.
+    tp=1 / no-added-vocab only; TP>1 stays eager in the worker.
     """
 
     def __init__(self, *, weight, block_size, num_org, org_vocab_start):
@@ -76,8 +73,7 @@ class _DflashDraftSampleHook:
         self.org_vocab_start = int(org_vocab_start)
 
     def run(self, hidden_states, out_tokens):
-        # [bs * block_size, H]; draft tokens are block positions 1: (pos 0 is the
-        # seeded bonus token).
+        # draft tokens are block positions 1: (pos 0 is the seeded bonus token)
         bs = hidden_states.shape[0] // self.block_size
         hs = hidden_states.view(bs, self.block_size, -1)[:, 1:, :].reshape(
             -1, hidden_states.shape[-1]
@@ -190,7 +186,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         set_global_server_args_for_scheduler(saved_server_args)
         self.draft_model_runner = self._draft_worker.model_runner
-        # Draft greedy-head graph hook (set in init_cuda_graphs); None = eager.
         self._draft_sample_hook = None
         # Keep the same alias that other spec-v2 workers expose.
         self._draft_worker.draft_runner = self.draft_model_runner
@@ -340,7 +335,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     available_mem,
                 )
         if capture_decode_cuda_graph:
-            # Attach before capture so the draft graph can fold the head in.
+            # Must run before capture so the draft graph folds the head in.
             self._draft_sample_hook = self._maybe_build_draft_sample_hook()
             self.draft_model_runner.dflash_draft_sample = self._draft_sample_hook
         self._draft_worker.init_cuda_graphs(
@@ -348,8 +343,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
     def _maybe_build_draft_sample_hook(self):
-        # Capturable only on the tp=1 / no-added-vocab fast path; otherwise keep
-        # the eager (TP-aware) head in the worker.
         if get_tp_group().world_size != 1:
             return None
         target_model = self._target_worker.model_runner.model
@@ -359,8 +352,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             or not hasattr(lm_head, "weight")
             or not torch.is_floating_point(lm_head.weight)
         ):
-            # Quantized lm_head (FP8/INT) can't go through the static float
-            # matmul hook; keep the eager head for it.
+            # Quantized lm_head (FP8/INT) would break the static matmul.
             return None
         if not hasattr(lm_head, "shard_indices"):
             num_org = int(lm_head.weight.shape[0])
@@ -1558,7 +1550,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             and draft_out.can_run_graph
             and getattr(graph_runner, "dflash_draft_tokens_buf", None) is not None
         ):
-            # Head ran inside the draft cuda graph; read its output buffer.
             draft_next = graph_runner.dflash_draft_tokens_buf[
                 : bs * (int(self.block_size) - 1)
             ].view(bs, int(self.block_size) - 1)

@@ -359,9 +359,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
 
     def _init_dflash_draft_sample(self):
-        # DFLASH may fold its draft greedy head into this graph; allocate the
-        # output buffer for the proposed draft tokens (block positions 1:). The
-        # hook is attached to the draft model_runner before capture.
         self.dflash_draft_sample = getattr(
             self.model_runner, "dflash_draft_sample", None
         )
@@ -830,8 +827,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     and isinstance(out, LogitsProcessorOutput)
                     and out.hidden_states is not None
                 ):
-                    # Fold the draft greedy head into the captured region (see
-                    # _DflashDraftSampleHook); replays with the forward.
                     self.dflash_draft_sample.run(
                         out.hidden_states,
                         self.dflash_draft_tokens_buf[: num_tokens - bs],
